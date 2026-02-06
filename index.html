@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Parcel Scanner – Pro Kalibrierung</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="onOpenCvReady()"></script>
+    <style>
+        body { margin:0; background:#050505; color:white; overflow:hidden; font-family: 'Inter', system-ui, sans-serif; }
+        /* Video und Canvas füllen den Screen */
+        video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+        
+        /* UI Panel - Glassmorphism Style */
+        .panel { 
+            position:absolute; bottom:20px; left:20px; right:20px; 
+            background:rgba(10, 10, 10, 0.85); 
+            padding:20px; border-radius:20px; 
+            backdrop-filter:blur(16px); 
+            border: 1px solid rgba(255,255,255,0.1);
+            z-index:10; 
+            max-width: 500px;
+            margin: 0 auto;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+        }
+
+        /* Buttons & Badges */
+        button { 
+            padding:12px 16px; border-radius:12px; font-weight:600; font-size: 14px;
+            margin-top:10px; width:100%; transition: all 0.2s; border:none; outline:none;
+        }
+        button:active { transform: scale(0.98); }
+        button:disabled { opacity: 0.4; cursor: not-allowed; filter: grayscale(1); }
+        
+        .primary { background: linear-gradient(135deg, #FFD700, #FDB931); color:black; box-shadow: 0 4px 15px rgba(255, 215, 0, 0.3); }
+        .secondary { background:#333; color:white; border: 1px solid #444; }
+        
+        .badge { 
+            padding:4px 10px; border-radius:6px; font-size:11px; font-weight:bold; 
+            text-transform: uppercase; letter-spacing: 0.5px; display:inline-block; 
+        }
+
+        /* Scan Overlay Animation */
+        .scan-flash { animation: flash-anim 0.3s ease-out; }
+        @keyframes flash-anim { 0% { background: rgba(255,255,255,0.8); } 100% { background: transparent; } }
+        
+        /* Grid Overlay for Guide */
+        .grid-overlay {
+            position: absolute; inset:0; pointer-events: none; opacity: 0.1;
+            background-image: linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px);
+            background-size: 50px 50px;
+        }
+    </style>
+</head>
+<body>
+
+<!-- Hidden Video Element for Stream Source -->
+<video id="video" playsinline muted style="display:none"></video>
+
+<!-- Canvas for rendering processed frames -->
+<canvas id="canvas"></canvas>
+<div id="flash-layer" class="absolute inset-0 pointer-events-none"></div>
+<div class="grid-overlay"></div>
+
+<!-- Control Interface -->
+<div class="panel">
+    <div class="flex justify-between items-start mb-2">
+        <div>
+            <h2 class="text-lg font-bold text-white tracking-tight">Scanner Kalibrierung</h2>
+            <div id="status-msg" class="text-xs text-yellow-500 font-mono mt-1">Lade OpenCV...</div>
+        </div>
+        <div id="quality-badge" class="badge bg-gray-700 text-gray-300">Warte</div>
+    </div>
+
+    <!-- Progress Bar -->
+    <div class="mt-4 mb-1 flex justify-between text-xs text-gray-400">
+        <span>Fortschritt</span>
+        <span><span id="count">0</span> / 8 Scans</span>
+    </div>
+    <div class="h-2 bg-gray-800 rounded-full overflow-hidden mb-4">
+        <div id="progress" class="h-full bg-yellow-500 w-0 transition-all duration-300 ease-out"></div>
+    </div>
+
+    <!-- Action Buttons -->
+    <div class="grid grid-cols-2 gap-3">
+        <button id="btn-start" class="primary col-span-2" onclick="startCamera()" disabled>Kamera starten</button>
+        <button id="btn-capture" class="secondary" onclick="captureView()" disabled>Scan speichern</button>
+        <button id="btn-calc" class="primary bg-blue-600 hidden" onclick="runCalibration()">Berechnen</button>
+        <button class="secondary bg-red-900/30 text-red-200 border-red-900/50" onclick="resetAll()">Reset</button>
+    </div>
+    
+    <div class="text-[10px] text-gray-500 mt-3 text-center leading-tight">
+        Platziere ein DIN A4 Blatt auf dunklem Untergrund.<br>
+        Erfasse es aus verschiedenen Winkeln.
+    </div>
+</div>
+
+<script>
+/**
+ * KONFIGURATION
+ */
+const REQUIRED_VIEWS = 8;
+const A4_WIDTH_MM = 210;
+const A4_HEIGHT_MM = 297;
+
+/**
+ * STATE MANAGEMENT
+ */
+let video = document.getElementById("video");
+let canvas = document.getElementById("canvas");
+let ctx = canvas.getContext("2d", { willReadFrequently: true });
+let collectedCorners = []; // Speichert Arrays von je 4 Punkten
+let isVideoPlaying = false;
+let currentQuad = null; // Aktuell erkanntes Viereck
+
+/**
+ * OPENCV INITIALISIERUNG
+ */
+function onOpenCvReady() {
+    document.getElementById("status-msg").innerText = "System bereit";
+    document.getElementById("status-msg").className = "text-xs text-green-400 font-mono mt-1";
+    document.getElementById("btn-start").disabled = false;
+}
+
+/**
+ * KAMERA STARTEN
+ */
+async function startCamera(){
+    try {
+        // Fordere HD Auflösung an, Facing Mode Environment (Rückkamera)
+        const constraints = { 
+            video: { 
+                facingMode: "environment", 
+                width: { ideal: 1920 }, 
+                height: { ideal: 1080 } 
+            } 
+        };
+        
+        let stream = await navigator.mediaDevices.getUserMedia(constraints);
+        video.srcObject = stream;
+        
+        await new Promise((resolve) => {
+            video.onloadedmetadata = () => { resolve(); };
+        });
+        
+        await video.play();
+        
+        // Canvas Größe an Video anpassen
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        
+        // UI Updates
+        document.getElementById("btn-start").style.display = "none";
+        document.getElementById("btn-capture").disabled = false;
+        document.getElementById("status-msg").innerText = "Suche A4 Referenz...";
+        
+        isVideoPlaying = true;
+        requestAnimationFrame(processFrame);
+        
+    } catch (e) {
+        alert("Kamera-Fehler: " + e.message);
+        document.getElementById("status-msg").innerText = "Fehler: Kein Zugriff";
+        document.getElementById("status-msg").className = "text-xs text-red-500 font-mono mt-1";
+    }
+}
+
+/**
+ * HAUPTSCHLEIFE (FRAME PROCESSING)
+ */
+function processFrame(){
+    if(!isVideoPlaying) return;
+
+    // 1. Frame auf Canvas zeichnen
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    
+    // 2. OpenCV Verarbeitung
+    let src = cv.imread(canvas);
+    let gray = new cv.Mat();
+    
+    // Optimierung: Bild für Erkennung verkleinern (schneller)
+    let scale = 0.5;
+    let smallSrc = new cv.Mat();
+    cv.resize(src, smallSrc, new cv.Size(0,0), scale, scale, cv.INTER_AREA);
+    
+    cv.cvtColor(smallSrc, gray, cv.COLOR_RGBA2GRAY);
+    cv.GaussianBlur(gray, gray, new cv.Size(5, 5), 0);
+    cv.Canny(gray, gray, 75, 200); // Kanten finden
+
+    // Konturen finden
+    let contours = new cv.MatVector();
+    let hierarchy = new cv.Mat();
+    cv.findContours(gray, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+
+    let foundQuad = null;
+    let maxArea = (canvas.width * canvas.height * 0.05) * (scale * scale); // Mindestens 5% des Bildes
+
+    // Durch alle Konturen loopen
+    for(let i=0; i<contours.size(); i++){
+        let cnt = contours.get(i);
+        let area = cv.contourArea(cnt);
+        
+        // Nur große Flächen betrachten
+        if(area > maxArea){
+            let peri = cv.arcLength(cnt, true);
+            let approx = new cv.Mat();
+            cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+
+            // Ist es ein Viereck und konvex?
+            if(approx.rows == 4 && cv.isContourConvex(approx)){
+                maxArea = area;
+                if(foundQuad) foundQuad.delete();
+                foundQuad = approx.clone(); // Kopie speichern
+            }
+            approx.delete();
+        }
+        cnt.delete();
+    }
+
+    // Wenn gefunden, hochskalieren und zeichnen
+    if(foundQuad) {
+        // Koordinaten zurückskalieren auf Originalgröße
+        let scaledPoints = [];
+        for(let i=0; i<4; i++){
+            scaledPoints.push({
+                x: foundQuad.data32S[i*2] / scale,
+                y: foundQuad.data32S[i*2+1] / scale
+            });
+        }
+        
+        // Sortieren für konsistente Reihenfolge (TL, TR, BR, BL)
+        currentQuad = sortCorners(scaledPoints);
+        drawAugmentedReality(currentQuad);
+        
+        document.getElementById("status-msg").innerText = "Referenz erkannt - Bereit zum Scannen";
+        document.getElementById("status-msg").className = "text-xs text-green-400 font-mono mt-1";
+        document.getElementById("btn-capture").classList.remove("opacity-50");
+        
+        foundQuad.delete();
+    } else {
+        currentQuad = null;
+        document.getElementById("status-msg").innerText = "Suche A4 Referenz...";
+        document.getElementById("status-msg").className = "text-xs text-yellow-500 font-mono mt-1";
+        document.getElementById("btn-capture").classList.add("opacity-50");
+    }
+
+    // Aufräumen (WICHTIG in OpenCV.js um Memory Leaks zu vermeiden)
+    src.delete(); smallSrc.delete(); gray.delete(); contours.delete(); hierarchy.delete();
+    
+    requestAnimationFrame(processFrame);
+}
+
+/**
+ * VISUALISIERUNG
+ */
+function drawAugmentedReality(pts){
+    // Linie zeichnen
+    ctx.strokeStyle = "#00FF00";
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for(let i=1; i<4; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.closePath();
+    ctx.stroke();
+
+    // Ecken markieren
+    ctx.fillStyle = "#FFD700";
+    pts.forEach(p => {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 8, 0, 2*Math.PI);
+        ctx.fill();
+    });
+}
+
+/**
+ * HILFSFUNKTION: ECKEN SORTIEREN
+ * Sortiert Punkte zu: Top-Left, Top-Right, Bottom-Right, Bottom-Left
+ */
+function sortCorners(pts) {
+    // Sortiere nach Y
+    pts.sort((a,b) => a.y - b.y);
+    
+    // Nimm die obersten 2
+    let top = pts.slice(0,2).sort((a,b) => a.x - b.x);
+    // Nimm die untersten 2
+    let bottom = pts.slice(2,4).sort((a,b) => b.x - a.x); // b.x - a.x macht hier Bottom-Right zuerst, wir wollen aber übliche Reihenfolge
+    
+    // Korrektur: Wir wollen TL, TR, BR, BL für OpenCV Mapping
+    // top[0] = TL, top[1] = TR
+    // bottom sortiert nach x aufsteigend: [0]=BL, [1]=BR
+    bottom.sort((a,b) => a.x - b.x);
+    
+    // Rückgabe im Uhrzeigersinn startend bei TL: TL, TR, BR, BL
+    return [ top[0], top[1], bottom[1], bottom[0] ];
+}
+
+/**
+ * CAPTURE
+ */
+function captureView(){
+    if(!currentQuad) return;
+
+    // Flash Effekt
+    let flash = document.getElementById("flash-layer");
+    flash.className = "absolute inset-0 scan-flash";
+    setTimeout(() => flash.className = "absolute inset-0 pointer-events-none", 300);
+
+    // Daten speichern
+    // Wir speichern eine tiefe Kopie der aktuellen Koordinaten
+    collectedCorners.push(JSON.parse(JSON.stringify(currentQuad)));
+    
+    updateUI();
+}
+
+function updateUI(){
+    let count = collectedCorners.length;
+    document.getElementById("count").innerText = count;
+    let pct = Math.min((count/REQUIRED_VIEWS)*100, 100);
+    document.getElementById("progress").style.width = pct + "%";
+    
+    if(count >= REQUIRED_VIEWS){
+        document.getElementById("btn-capture").style.display = "none";
+        document.getElementById("btn-calc").classList.remove("hidden");
+        document.getElementById("btn-calc").classList.add("block");
+        document.getElementById("status-msg").innerText = "Daten vollständig. Berechne...";
+    }
+}
+
+/**
+ * KALIBRIERUNG BERECHNEN
+ */
+function runCalibration(){
+    if(collectedCorners.length < REQUIRED_VIEWS) return;
+
+    // OpenCV Strukturen vorbereiten
+    let objPoints = new cv.MatVector();
+    let imgPoints = new cv.MatVector();
+
+    // Definition der Welt-Koordinaten (A4 Blatt flach bei z=0)
+    // TL(0,0), TR(w,0), BR(w,h), BL(0,h)
+    let obj = cv.matFromArray(4, 1, cv.CV_32FC3, [
+        0, 0, 0,
+        A4_WIDTH_MM, 0, 0,
+        A4_WIDTH_MM, A4_HEIGHT_MM, 0,
+        0, A4_HEIGHT_MM, 0
+    ]);
+
+    // Daten in OpenCV Format konvertieren
+    for(let pts of collectedCorners){
+        let img = new cv.Mat(4, 1, cv.CV_32FC2);
+        for(let i=0; i<4; i++){
+            img.data32F[i*2] = pts[i].x;
+            img.data32F[i*2+1] = pts[i].y;
+        }
+        objPoints.push_back(obj);
+        imgPoints.push_back(img);
+    }
+
+    // Initialisiere Output Matrizen
+    let camMatrix = new cv.Mat.eye(3, 3, cv.CV_64F); // Intrinsische Matrix
+    let distCoeffs = new cv.Mat.zeros(8, 1, cv.CV_64F); // Verzerrungskoeffizienten
+    let rvecs = new cv.MatVector(); // Rotationsvektoren
+    let tvecs = new cv.MatVector(); // Translationsvektoren
+
+    try {
+        // Die Magie: Kalibrierung
+        let rms = cv.calibrateCamera(
+            objPoints, 
+            imgPoints, 
+            new cv.Size(canvas.width, canvas.height), 
+            camMatrix, 
+            distCoeffs, 
+            rvecs, 
+            tvecs
+        );
+
+        console.log("RMS Error:", rms);
+        console.log("Camera Matrix:", camMatrix.data64F);
+        console.log("Distortion Coeffs:", distCoeffs.data64F);
+
+        // UI Feedback
+        let badge = document.getElementById("quality-badge");
+        badge.innerText = `RMS: ${rms.toFixed(2)}`;
+        
+        if(rms < 1.0) {
+            badge.className = "badge bg-green-600 text-white";
+            alert(`Erfolg! Sehr gute Kalibrierung.\nRMS Fehler: ${rms.toFixed(2)} px`);
+        } else if (rms < 3.0) {
+            badge.className = "badge bg-yellow-600 text-white";
+            alert(`Okay. Kalibrierung akzeptabel.\nRMS Fehler: ${rms.toFixed(2)} px`);
+        } else {
+            badge.className = "badge bg-red-600 text-white";
+            alert(`Warnung: Ungenaue Kalibrierung.\nRMS Fehler: ${rms.toFixed(2)} px\nVersuche bessere Lichtverhältnisse.`);
+        }
+
+    } catch(e) {
+        console.error(e);
+        alert("Fehler bei der Berechnung. Bitte Reset drücken.");
+    }
+
+    // Speicher freigeben
+    objPoints.delete(); imgPoints.delete();
+    rvecs.delete(); tvecs.delete();
+    camMatrix.delete(); distCoeffs.delete();
+    obj.delete();
+}
+
+function resetAll(){
+    collectedCorners = [];
+    updateUI();
+    document.getElementById("btn-capture").style.display = "inline-block";
+    document.getElementById("btn-calc").classList.add("hidden");
+    document.getElementById("quality-badge").innerText = "Warte";
+    document.getElementById("quality-badge").className = "badge bg-gray-700 text-gray-300";
+}
+</script>
+</body>
+</html>
