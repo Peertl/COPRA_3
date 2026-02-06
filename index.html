@@ -312,3 +312,106 @@ function captureView(){
 }
 
 function updateUI(){
+    let count = collectedCorners.length;
+    document.getElementById("count").innerText = count;
+    let pct = Math.min((count/REQUIRED_VIEWS)*100, 100);
+    document.getElementById("progress").style.width = pct + "%";
+    
+    if(count >= REQUIRED_VIEWS){
+        document.getElementById("btn-capture").style.display = "none";
+        document.getElementById("btn-calc").classList.remove("hidden");
+        document.getElementById("btn-calc").classList.add("block");
+        document.getElementById("status-msg").innerText = "Daten vollständig. Berechne...";
+    }
+}
+
+/**
+ * KALIBRIERUNG BERECHNEN
+ */
+function runCalibration(){
+    if(collectedCorners.length < REQUIRED_VIEWS) return;
+
+    // OpenCV Strukturen vorbereiten
+    let objPoints = new cv.MatVector();
+    let imgPoints = new cv.MatVector();
+
+    // Definition der Welt-Koordinaten (A4 Blatt flach bei z=0)
+    // TL(0,0), TR(w,0), BR(w,h), BL(0,h)
+    let obj = cv.matFromArray(4, 1, cv.CV_32FC3, [
+        0, 0, 0,
+        A4_WIDTH_MM, 0, 0,
+        A4_WIDTH_MM, A4_HEIGHT_MM, 0,
+        0, A4_HEIGHT_MM, 0
+    ]);
+
+    // Daten in OpenCV Format konvertieren
+    for(let pts of collectedCorners){
+        let img = new cv.Mat(4, 1, cv.CV_32FC2);
+        for(let i=0; i<4; i++){
+            img.data32F[i*2] = pts[i].x;
+            img.data32F[i*2+1] = pts[i].y;
+        }
+        objPoints.push_back(obj);
+        imgPoints.push_back(img);
+    }
+
+    // Initialisiere Output Matrizen
+    let camMatrix = new cv.Mat.eye(3, 3, cv.CV_64F); // Intrinsische Matrix
+    let distCoeffs = new cv.Mat.zeros(8, 1, cv.CV_64F); // Verzerrungskoeffizienten
+    let rvecs = new cv.MatVector(); // Rotationsvektoren
+    let tvecs = new cv.MatVector(); // Translationsvektoren
+
+    try {
+        // Die Magie: Kalibrierung
+        let rms = cv.calibrateCamera(
+            objPoints, 
+            imgPoints, 
+            new cv.Size(canvas.width, canvas.height), 
+            camMatrix, 
+            distCoeffs, 
+            rvecs, 
+            tvecs
+        );
+
+        console.log("RMS Error:", rms);
+        console.log("Camera Matrix:", camMatrix.data64F);
+        console.log("Distortion Coeffs:", distCoeffs.data64F);
+
+        // UI Feedback
+        let badge = document.getElementById("quality-badge");
+        badge.innerText = `RMS: ${rms.toFixed(2)}`;
+        
+        if(rms < 1.0) {
+            badge.className = "badge bg-green-600 text-white";
+            alert(`Erfolg! Sehr gute Kalibrierung.\nRMS Fehler: ${rms.toFixed(2)} px`);
+        } else if (rms < 3.0) {
+            badge.className = "badge bg-yellow-600 text-white";
+            alert(`Okay. Kalibrierung akzeptabel.\nRMS Fehler: ${rms.toFixed(2)} px`);
+        } else {
+            badge.className = "badge bg-red-600 text-white";
+            alert(`Warnung: Ungenaue Kalibrierung.\nRMS Fehler: ${rms.toFixed(2)} px\nVersuche bessere Lichtverhältnisse.`);
+        }
+
+    } catch(e) {
+        console.error(e);
+        alert("Fehler bei der Berechnung. Bitte Reset drücken.");
+    }
+
+    // Speicher freigeben
+    objPoints.delete(); imgPoints.delete();
+    rvecs.delete(); tvecs.delete();
+    camMatrix.delete(); distCoeffs.delete();
+    obj.delete();
+}
+
+function resetAll(){
+    collectedCorners = [];
+    updateUI();
+    document.getElementById("btn-capture").style.display = "inline-block";
+    document.getElementById("btn-calc").classList.add("hidden");
+    document.getElementById("quality-badge").innerText = "Warte";
+    document.getElementById("quality-badge").className = "badge bg-gray-700 text-gray-300";
+}
+</script>
+</body>
+</html>
